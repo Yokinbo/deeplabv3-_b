@@ -9,12 +9,12 @@ import numpy as np
 from PIL import Image
 
 from deeplab import DeeplabV3
+from multispectral_config import image_ext, in_channels, selected_bands, trained_model_path
 
 if __name__ == "__main__":
     #-------------------------------------------------------------------------#
     #   如果想要修改对应种类的颜色，到__init__函数里修改self.colors即可
     #-------------------------------------------------------------------------#
-    deeplab = DeeplabV3()
     #----------------------------------------------------------------------------------------------------------#
     #   mode用于指定测试的模式：
     #   'predict'           表示单张图片预测，如果想对预测过程进行修改，如保存图片，截取对象等，可以先看下方详细的注释
@@ -70,6 +70,23 @@ if __name__ == "__main__":
     simplify        = True
     onnx_save_path  = "model_data/models.onnx"
 
+    #-------------------------------------------------------------------------#
+    #   多光谱配置
+    #-------------------------------------------------------------------------#
+    # 训练、推理、mIoU 统一从 multispectral_config.py 读取：
+    # - trained_model_path 当前要加载的权重
+    # - image_ext          当前影像后缀，默认 .tif
+    # - selected_bands     当前实际送进模型的波段
+    # - in_channels        模型输入通道数
+    #
+    # 这样切换 rgb / 4band / 6band 时，优先只改 multispectral_config.py。
+    deeplab = DeeplabV3(
+        model_path=trained_model_path,
+        image_ext=image_ext,
+        selected_bands=selected_bands,
+        in_channels=in_channels,
+    )
+
     if mode == "predict":
         '''
         predict.py有几个注意点
@@ -87,7 +104,12 @@ if __name__ == "__main__":
         while True:
             img = input('Input image filename:')
             try:
-                image = Image.open(img)
+                # tif 多光谱不能先用 PIL 打开，否则会丢失或压缩波段信息。
+                # 这里直接把路径交给 deeplab.detect_image，由 deeplab.py 内部用 rasterio 读取。
+                if img.lower().endswith((".tif", ".tiff")):
+                    image = img
+                else:
+                    image = Image.open(img)
             except:
                 print('Open Error! Try again!')
                 continue
@@ -142,7 +164,10 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
 
     elif mode == "fps":
-        img = Image.open(fps_image_path)
+        if fps_image_path.lower().endswith((".tif", ".tiff")):
+            img = fps_image_path
+        else:
+            img = Image.open(fps_image_path)
         tact_time = deeplab.get_FPS(img, test_interval)
         print(str(tact_time) + ' seconds, ' + str(1/tact_time) + 'FPS, @batch_size 1')
         
@@ -154,11 +179,16 @@ if __name__ == "__main__":
         for img_name in tqdm(img_names):
             if img_name.lower().endswith(('.bmp', '.dib', '.png', '.jpg', '.jpeg', '.pbm', '.pgm', '.ppm', '.tif', '.tiff')):
                 image_path  = os.path.join(dir_origin_path, img_name)
-                image       = Image.open(image_path)
+                # 多光谱 tif 直接传路径，普通图片保留 PIL 打开方式。
+                if img_name.lower().endswith((".tif", ".tiff")):
+                    image = image_path
+                else:
+                    image = Image.open(image_path)
                 r_image     = deeplab.detect_image(image)
                 if not os.path.exists(dir_save_path):
                     os.makedirs(dir_save_path)
-                r_image.save(os.path.join(dir_save_path, img_name))
+                save_name = os.path.splitext(img_name)[0] + ".png"
+                r_image.save(os.path.join(dir_save_path, save_name))
     elif mode == "export_onnx":
         deeplab.convert_to_onnx(simplify, onnx_save_path)
         

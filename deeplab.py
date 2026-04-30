@@ -4,6 +4,7 @@ import time
 
 import cv2
 import numpy as np
+import rasterio
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -11,6 +12,8 @@ from torch import nn
 
 from nets.deeplabv3_plus import DeepLab
 from utils.utils import cvtColor, preprocess_input, resize_image, show_config
+from multispectral_config import (image_ext, in_channels, selected_bands,
+                                  trained_model_path, vis_bands)
 
 #训练完之后进行预测与计算miou都需要修改这里
 #计算get_miou也需要在这里修改
@@ -27,7 +30,7 @@ class DeeplabV3(object):
         #   训练好后logs文件夹下存在多个权值文件，选择验证集损失较低的即可。
         #   验证集损失较低不代表miou较高，仅代表该权值在验证集上泛化性能较好。
         #-------------------------------------------------------------------#
-        "model_path"        : 'logs/best_epoch_weights.pth',
+        "model_path"        : trained_model_path,
         #----------------------------------------#
         #   所需要区分的类的个数+1
         #----------------------------------------#
@@ -42,6 +45,17 @@ class DeeplabV3(object):
         #   输入图片的大小
         #----------------------------------------#
         "input_shape"       : [512, 512],
+        #----------------------------------------#
+        #   多光谱相关配置：
+        #   image_ext      影像后缀，例如 .tif / .jpg
+        #   selected_bands 实际送进模型的波段，rasterio 使用 1-based 编号
+        #   vis_bands      多波段可视化时用于生成 RGB 预览的波段
+        #   in_channels    模型第一层输入通道数，必须等于 selected_bands 长度
+        #----------------------------------------#
+        "image_ext"         : image_ext,
+        "selected_bands"    : selected_bands,
+        "vis_bands"         : vis_bands,
+        "in_channels"       : in_channels,
         #----------------------------------------#
         #   下采样的倍数，一般可选的为8和16
         #   与训练时设置的一样即可
@@ -69,6 +83,11 @@ class DeeplabV3(object):
         self.__dict__.update(self._defaults)
         for name, value in kwargs.items():
             setattr(self, name, value)
+        # 如果用户只显式传了 selected_bands，没有同步传 in_channels，
+        # 这里自动按波段数量修正，减少手动配置出错的机会。
+        # 若 selected_bands=None，则表示读取 tif 的全部波段，此时保留用户传入的 in_channels。
+        if self.selected_bands is not None:
+            self.in_channels = len(self.selected_bands)
         #---------------------------------------------------#
         #   画框设置不同的颜色
         #---------------------------------------------------#
@@ -86,7 +105,10 @@ class DeeplabV3(object):
         #---------------------------------------------------#
         self.generate()
         
-        show_config(**self._defaults)
+        # 打印实际生效配置，而不是只打印 _defaults。
+        # 这样当外部传入 model_path / backbone / selected_bands 等参数时，
+        # 控制台显示的就是当前真正用于推理的配置。
+        show_config(**{key: getattr(self, key) for key in self._defaults})
                     
     #---------------------------------------------------#
     #   获得所有的分类
@@ -95,7 +117,13 @@ class DeeplabV3(object):
         #-------------------------------#
         #   载入模型与权值
         #-------------------------------#
-        self.net = DeepLab(num_classes=self.num_classes, backbone=self.backbone, downsample_factor=self.downsample_factor, pretrained=False)
+        self.net = DeepLab(
+            num_classes=self.num_classes,
+            backbone=self.backbone,
+            downsample_factor=self.downsample_factor,
+            pretrained=False,
+            in_channels=self.in_channels,
+        )
 
         device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.load_state_dict(torch.load(self.model_path, map_location=device))
@@ -106,30 +134,113 @@ class DeeplabV3(object):
                 self.net = nn.DataParallel(self.net)
                 self.net = self.net.cuda()
 
+    def read_image(self, image):
+        # predict.py 里为了避免 PIL 打开 tif 丢失多波段信息，会直接把路径传进来。
+        # 这里统一处理：
+        # - tif/tiff 路径：rasterio 读取 selected_bands，返回 HWC numpy
+        # - 其它路径：PIL 打开，保持原 RGB 兼容流程
+        # - 已经传入的 PIL/numpy：直接返回
+        if not isinstance(image, str):
+            return image
+
+        if image.lower().endswith((".tif", ".tiff")):
+            with rasterio.open(image) as src:
+                if self.selected_bands is None:
+                    band_indexes = list(range(1, src.count + 1))
+                else:
+                    band_indexes = self.selected_bands
+
+                if max(band_indexes) > src.count:
+                    raise ValueError(
+                        f"{image} 只有 {src.count} 个波段，"
+                        f"但当前 selected_bands={band_indexes}。"
+                    )
+
+                arr = src.read(indexes=band_indexes)
+                arr = np.transpose(arr, (1, 2, 0))
+            return arr
+
+        return Image.open(image)
+
+    def resize_multiband_image(self, image, size):
+        # resize_image 使用 PIL，只适合 RGB。
+        # 多波段 numpy 影像需要用 cv2 做等比例缩放，再手动 padding。
+        ih, iw  = image.shape[:2]
+        w, h    = size
+
+        scale   = min(w / iw, h / ih)
+        nw      = int(iw * scale)
+        nh      = int(ih * scale)
+
+        image   = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if image.ndim == 2:
+            image = np.expand_dims(image, -1)
+
+        channels = image.shape[2]
+        new_image = np.zeros((h, w, channels), dtype=image.dtype)
+        new_image[(h - nh) // 2:(h - nh) // 2 + nh, (w - nw) // 2:(w - nw) // 2 + nw, :] = image
+        return new_image, nw, nh
+
+    def multiband_to_rgb_preview(self, image):
+        # 检测结果 mix_type=0/2 需要和原图叠加显示。
+        # 但 4/6 波段数组不能直接 Image.blend，所以这里用 vis_bands 生成一张 RGB 预览图。
+        if isinstance(image, Image.Image):
+            return cvtColor(image)
+
+        image = np.array(image)
+        if image.ndim == 2:
+            image = np.expand_dims(image, -1)
+
+        vis_band_indexes = self.vis_bands or [1, 2, 3]
+        if image.shape[2] >= max(vis_band_indexes):
+            idx = [band - 1 for band in vis_band_indexes]
+        elif image.shape[2] >= 3:
+            idx = [0, 1, 2]
+        else:
+            idx = [0, 0, 0]
+
+        rgb = image[:, :, idx].astype(np.float32)
+        out = np.zeros_like(rgb, dtype=np.uint8)
+        for i in range(rgb.shape[2]):
+            band = rgb[:, :, i]
+            low, high = np.percentile(band, [2, 98])
+            if high <= low:
+                out[:, :, i] = np.clip(band, 0, 255).astype(np.uint8)
+            else:
+                out[:, :, i] = np.clip((band - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(out)
+
+    def prepare_input(self, image):
+        # 统一把 PIL/RGB 或 tif 多波段影像整理成模型输入：
+        # - image_data: [1, C, H, W]
+        # - nw/nh: letterbox resize 后的有效区域尺寸
+        # - original_h/original_w: 原图尺寸
+        # - old_img: 用于结果叠加显示的 RGB 预览图
+        image = self.read_image(image)
+
+        if isinstance(image, Image.Image):
+            image = cvtColor(image)
+            old_img = copy.deepcopy(image)
+            image_array = np.array(image, np.float32)
+            image_data, nw, nh = resize_image(image, (self.input_shape[1], self.input_shape[0]))
+            image_data = np.array(image_data, np.float32)
+        else:
+            image_array = np.array(image, np.float32)
+            if image_array.ndim == 2:
+                image_array = np.expand_dims(image_array, -1)
+            old_img = self.multiband_to_rgb_preview(image_array)
+            image_data, nw, nh = self.resize_multiband_image(image_array, (self.input_shape[1], self.input_shape[0]))
+
+        original_h = image_array.shape[0]
+        original_w = image_array.shape[1]
+        image_data = np.expand_dims(np.transpose(preprocess_input(image_data), (2, 0, 1)), 0)
+        return image_data, nw, nh, original_h, original_w, old_img
+
     #---------------------------------------------------#
     #   检测图片
     #---------------------------------------------------#
     def detect_image(self, image, count=False, name_classes=None):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------#
-        #   对输入图像进行一个备份，后面用于绘图
-        #---------------------------------------------------#
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data, nw, nh, orininal_h, orininal_w, old_img = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -214,20 +325,7 @@ class DeeplabV3(object):
         return image
 
     def get_FPS(self, image, test_interval):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data, nw, nh, _, _, _ = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -272,7 +370,7 @@ class DeeplabV3(object):
         import onnx
         self.generate(onnx=True)
 
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
+        im                  = torch.zeros(1, self.in_channels, *self.input_shape).to('cpu')  # BCHW
         input_layer_names   = ["images"]
         output_layer_names  = ["output"]
         
@@ -307,22 +405,7 @@ class DeeplabV3(object):
         print('Onnx model save as {}'.format(model_path))
     
     def get_miou_png(self, image):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data, nw, nh, orininal_h, orininal_w, _ = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)

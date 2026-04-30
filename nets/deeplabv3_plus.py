@@ -5,11 +5,14 @@ from nets.xception import xception
 from nets.mobilenetv2 import mobilenetv2
 
 class MobileNetV2(nn.Module):
-    def __init__(self, downsample_factor=8, pretrained=True):
+    def __init__(self, downsample_factor=8, pretrained=True, in_channels=3):
         super(MobileNetV2, self).__init__()
         from functools import partial
         
-        model           = mobilenetv2(pretrained)
+        # 将 in_channels 继续传给真正的 MobileNetV2 主干。
+        # 这样 DeepLab 外层只要传一次 in_channels，第一层卷积就能正确适配
+        # RGB / 4 波段 / 6 波段输入。
+        model           = mobilenetv2(pretrained, in_channels=in_channels)
         self.features   = model.features[:-1]
 
         self.total_idx  = len(self.features)
@@ -114,16 +117,26 @@ class ASPP(nn.Module):
 		return result
 
 class DeepLab(nn.Module):
-    def __init__(self, num_classes, backbone="mobilenet", pretrained=True, downsample_factor=16):
+    def __init__(self, num_classes, backbone="mobilenet", pretrained=True, downsample_factor=16, in_channels=3):
         super(DeepLab, self).__init__()
+        # in_channels 表示输入影像的通道数：
+        # - RGB 模式为 3
+        # - 4band 模式为 4
+        # - 6band 模式为 6
+        # 后面的 backbone_out_channels 才是主干网络输出给 ASPP 的特征通道数。
+        self.in_channels = in_channels
         if backbone=="xception":
             #----------------------------------#
             #   获得两个特征层
             #   浅层特征    [128,128,256]
             #   主干部分    [30,30,2048]
             #----------------------------------#
-            self.backbone = xception(downsample_factor=downsample_factor, pretrained=pretrained)
-            in_channels = 2048
+            self.backbone = xception(
+                downsample_factor=downsample_factor,
+                pretrained=pretrained,
+                in_channels=in_channels,
+            )
+            backbone_out_channels = 2048
             low_level_channels = 256
         elif backbone=="mobilenet":
             #----------------------------------#
@@ -131,8 +144,12 @@ class DeepLab(nn.Module):
             #   浅层特征    [128,128,24]
             #   主干部分    [30,30,320]
             #----------------------------------#
-            self.backbone = MobileNetV2(downsample_factor=downsample_factor, pretrained=pretrained)
-            in_channels = 320
+            self.backbone = MobileNetV2(
+                downsample_factor=downsample_factor,
+                pretrained=pretrained,
+                in_channels=in_channels,
+            )
+            backbone_out_channels = 320
             low_level_channels = 24
         else:
             raise ValueError('Unsupported backbone - `{}`, Use mobilenet, xception.'.format(backbone))
@@ -141,7 +158,7 @@ class DeepLab(nn.Module):
         #   ASPP特征提取模块
         #   利用不同膨胀率的膨胀卷积进行特征提取
         #-----------------------------------------#
-        self.aspp = ASPP(dim_in=in_channels, dim_out=256, rate=16//downsample_factor)
+        self.aspp = ASPP(dim_in=backbone_out_channels, dim_out=256, rate=16//downsample_factor)
         
         #----------------------------------#
         #   浅层特征边

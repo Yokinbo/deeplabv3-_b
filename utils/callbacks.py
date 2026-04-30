@@ -11,6 +11,7 @@ import scipy.signal
 import cv2
 import shutil
 import numpy as np
+import rasterio
 
 from PIL import Image
 from tqdm import tqdm
@@ -20,7 +21,7 @@ from .utils_metrics import compute_mIoU
 
 
 class LossHistory():
-    def __init__(self, log_dir, model, input_shape):
+    def __init__(self, log_dir, model, input_shape, in_channels=3):
         self.log_dir    = log_dir
         self.losses     = []
         self.val_loss   = []
@@ -28,7 +29,10 @@ class LossHistory():
         os.makedirs(self.log_dir)
         self.writer     = SummaryWriter(self.log_dir)
         try:
-            dummy_input     = torch.randn(2, 3, input_shape[0], input_shape[1])
+            # TensorBoard add_graph 会真的跑一次模型。
+            # 多光谱训练时模型第一层可能是 4/6 通道，所以 dummy input
+            # 也必须跟随当前 in_channels，而不能继续固定写 3。
+            dummy_input     = torch.randn(2, in_channels, input_shape[0], input_shape[1])
             self.writer.add_graph(model, dummy_input)
         except:
             pass
@@ -80,7 +84,7 @@ class LossHistory():
 
 class EvalCallback():
     def __init__(self, net, input_shape, num_classes, image_ids, dataset_path, log_dir, cuda, \
-            miou_out_path=".temp_miou_out", eval_flag=True, period=1):
+            miou_out_path=".temp_miou_out", eval_flag=True, period=1, image_ext=".jpg", selected_bands=None):
         super(EvalCallback, self).__init__()
         
         self.net                = net
@@ -93,6 +97,10 @@ class EvalCallback():
         self.miou_out_path      = miou_out_path
         self.eval_flag          = eval_flag
         self.period             = period
+        # 验证阶段必须和训练阶段读取同样的影像后缀和波段。
+        # 否则会出现训练用 6 波段 tif，mIoU 却仍然读 jpg/RGB 的不一致。
+        self.image_ext          = image_ext
+        self.selected_bands     = selected_bands
         
         self.image_ids          = [image_id.split()[0] for image_id in image_ids]
         self.mious      = [0]
@@ -102,23 +110,66 @@ class EvalCallback():
                 f.write(str(0))
                 f.write("\n")
 
+    def read_eval_image(self, image_path):
+        # tif/tiff 使用 rasterio 读取多波段；其它格式继续使用 PIL。
+        if self.image_ext.lower() in [".tif", ".tiff"]:
+            with rasterio.open(image_path) as src:
+                if self.selected_bands is None:
+                    band_indexes = list(range(1, src.count + 1))
+                else:
+                    band_indexes = self.selected_bands
+
+                if max(band_indexes) > src.count:
+                    raise ValueError(
+                        f"{image_path} 只有 {src.count} 个波段，"
+                        f"但当前 selected_bands={band_indexes}。"
+                    )
+
+                image = src.read(indexes=band_indexes)
+                image = np.transpose(image, (1, 2, 0))
+            return image
+        return Image.open(image_path)
+
+    def resize_multiband_image(self, image, size):
+        # resize_image 只适合 PIL/RGB。
+        # 多波段 numpy 影像需要自己做等比例缩放 + padding。
+        ih, iw  = image.shape[:2]
+        w, h    = size
+
+        scale   = min(w / iw, h / ih)
+        nw      = int(iw * scale)
+        nh      = int(ih * scale)
+
+        image   = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if image.ndim == 2:
+            image = np.expand_dims(image, -1)
+
+        channels = image.shape[2]
+        new_image = np.zeros((h, w, channels), dtype=image.dtype)
+        new_image[(h - nh) // 2:(h - nh) // 2 + nh, (w - nw) // 2:(w - nw) // 2 + nw, :] = image
+        return new_image, nw, nh
+
     def get_miou_png(self, image):
         #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
+        #   RGB/PIL 图像走原来的 cvtColor + resize_image 流程。
+        #   多光谱 tif 已经在 read_eval_image 中读成 numpy 多通道数组，
+        #   这里会跳过 RGB 转换，直接做多波段 resize 和标准化。
         #---------------------------------------------------------#
-        image       = cvtColor(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        # RGB/PIL 保留原逻辑；多波段 tif 直接按 numpy 多通道处理。
+        if isinstance(image, Image.Image):
+            image       = cvtColor(image)
+            image_array = np.array(image, np.float32)
+            image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
+            image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        else:
+            image_array = np.array(image, np.float32)
+            if image_array.ndim == 2:
+                image_array = np.expand_dims(image_array, -1)
+            image_data, nw, nh = self.resize_multiband_image(image_array, (self.input_shape[1], self.input_shape[0]))
+            image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+
+        orininal_h  = image_array.shape[0]
+        orininal_w  = image_array.shape[1]
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -164,8 +215,8 @@ class EvalCallback():
                 #-------------------------------#
                 #   从文件中读取图像
                 #-------------------------------#
-                image_path  = os.path.join(self.dataset_path, "VOC2007/JPEGImages/"+image_id+".jpg")
-                image       = Image.open(image_path)
+                image_path  = os.path.join(self.dataset_path, "VOC2007/JPEGImages", image_id + self.image_ext)
+                image       = self.read_eval_image(image_path)
                 #------------------------------#
                 #   获得预测txt
                 #------------------------------#

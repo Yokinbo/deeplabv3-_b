@@ -78,7 +78,7 @@ class Xception(nn.Module):
     Xception optimized for the ImageNet dataset, as specified in
     https://arxiv.org/pdf/1610.02357.pdf
     """
-    def __init__(self, downsample_factor):
+    def __init__(self, downsample_factor, in_channels=3):
         """ Constructor
         Args:
             num_classes: number of classes
@@ -92,7 +92,10 @@ class Xception(nn.Module):
             stride_list = [2,2,1]
         else:
             raise ValueError('xception.py: output stride=%d is not supported.'%os) 
-        self.conv1 = nn.Conv2d(3, 32, 3, 2, 1, bias=False)
+        # 原始 Xception 第一层固定接收 RGB 三通道。
+        # 多光谱任务中，输入通道数由 multispectral_config.py 的 selected_bands 决定，
+        # 因此这里改成可配置的 in_channels。
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(32, momentum=bn_mom)
         self.relu = nn.ReLU(inplace=True)
         
@@ -191,8 +194,27 @@ def load_url(url, model_dir='./model_data', map_location=None):
     else:
         return model_zoo.load_url(url,model_dir=model_dir)
 
-def xception(pretrained=True, downsample_factor=16):
-    model = Xception(downsample_factor=downsample_factor)
+def _load_pretrained_matching_shape(model, pretrained_dict):
+    """
+    只加载形状完全一致的预训练参数。
+
+    多光谱输入会改变 conv1.weight 的形状，例如从 [32,3,3,3]
+    变成 [32,6,3,3]。这种 key 名相同但形状不同的参数即使 strict=False
+    也不能直接加载，所以这里过滤掉不匹配的参数。
+    """
+    model_dict = model.state_dict()
+    matched_dict = {
+        key: value
+        for key, value in pretrained_dict.items()
+        if key in model_dict and model_dict[key].shape == value.shape
+    }
+    model_dict.update(matched_dict)
+    model.load_state_dict(model_dict)
+
+
+def xception(pretrained=True, downsample_factor=16, in_channels=3):
+    model = Xception(downsample_factor=downsample_factor, in_channels=in_channels)
     if pretrained:
-        model.load_state_dict(load_url('https://github.com/bubbliiiing/deeplabv3-plus-pytorch/releases/download/v1.0/xception_pytorch_imagenet.pth'), strict=False)
+        pretrained_dict = load_url('https://github.com/bubbliiiing/deeplabv3-plus-pytorch/releases/download/v1.0/xception_pytorch_imagenet.pth')
+        _load_pretrained_matching_shape(model, pretrained_dict)
     return model

@@ -72,7 +72,7 @@ class InvertedResidual(nn.Module):
             return self.conv(x)
 
 class MobileNetV2(nn.Module):
-    def __init__(self, n_class=1000, input_size=224, width_mult=1.):
+    def __init__(self, n_class=1000, input_size=224, width_mult=1., in_channels=3):
         super(MobileNetV2, self).__init__()
         block = InvertedResidual
         input_channel = 32
@@ -91,8 +91,11 @@ class MobileNetV2(nn.Module):
         assert input_size % 32 == 0
         input_channel = int(input_channel * width_mult)
         self.last_channel = int(last_channel * width_mult) if width_mult > 1.0 else last_channel
-        # 512, 512, 3 -> 256, 256, 32
-        self.features = [conv_bn(3, input_channel, 2)]
+        # 512, 512, in_channels -> 256, 256, 32
+        # 原始 DeepLab 只支持 RGB，所以这里固定写死为 3。
+        # 多光谱训练时，输入可能是 4 或 6 个波段，因此第一层卷积的输入通道数
+        # 必须跟随 in_channels 变化，否则数据进入模型时会出现通道数不匹配。
+        self.features = [conv_bn(in_channels, input_channel, 2)]
 
         for t, c, n, s in interverted_residual_setting:
             output_channel = int(c * width_mult)
@@ -145,10 +148,31 @@ def load_url(url, model_dir='./model_data', map_location=None):
     else:
         return model_zoo.load_url(url,model_dir=model_dir)
 
+def _load_pretrained_matching_shape(model, pretrained_dict):
+    """
+    只加载形状完全一致的预训练参数。
+
+    说明：
+    - PyTorch 的 strict=False 只能允许“缺少 key / 多余 key”。
+    - 如果某个 key 名字相同但 tensor 形状不同，仍然会报错。
+    - 多光谱模型的第一层卷积从 3 通道变成 4/6 通道后，
+      预训练权重里的第一层形状一定对不上，所以这里主动跳过它。
+    """
+    model_dict = model.state_dict()
+    matched_dict = {
+        key: value
+        for key, value in pretrained_dict.items()
+        if key in model_dict and model_dict[key].shape == value.shape
+    }
+    model_dict.update(matched_dict)
+    model.load_state_dict(model_dict)
+
+
 def mobilenetv2(pretrained=False, **kwargs):
     model = MobileNetV2(n_class=1000, **kwargs)
     if pretrained:
-        model.load_state_dict(load_url('https://github.com/bubbliiiing/deeplabv3-plus-pytorch/releases/download/v1.0/mobilenet_v2.pth.tar'), strict=False)
+        pretrained_dict = load_url('https://github.com/bubbliiiing/deeplabv3-plus-pytorch/releases/download/v1.0/mobilenet_v2.pth.tar')
+        _load_pretrained_matching_shape(model, pretrained_dict)
     return model
 
 if __name__ == "__main__":

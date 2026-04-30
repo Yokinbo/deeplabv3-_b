@@ -1,6 +1,7 @@
 import datetime
 import os
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,6 +18,8 @@ from utils.dataloader import DeeplabDataset, deeplab_dataset_collate
 from utils.utils import (download_weights, seed_everything, show_config,
                          worker_init_fn)
 from utils.utils_fit import fit_one_epoch
+from multispectral_config import (band_mode, image_ext, in_channels,
+                                  normalization_config, selected_bands)
 
 '''
 训练自己的语义分割模型一定需要注意以下几点：
@@ -116,7 +119,7 @@ if __name__ == "__main__":
     #------------------------------#
     #   输入图片的大小
     #------------------------------#
-    input_shape         = [512, 512]
+    input_shape         = [256, 256]
     
     #----------------------------------------------------------------------------------------------------------------------------#
     #   训练分为两个阶段，分别是冻结阶段和解冻阶段。设置冻结阶段是为了满足机器性能不足的同学的训练需求。
@@ -160,7 +163,7 @@ if __name__ == "__main__":
     #                       (当Freeze_Train=False时失效)
     #------------------------------------------------------------------#
     Init_Epoch          = 0
-    Freeze_Epoch        = 100
+    Freeze_Epoch        = 30
     Freeze_batch_size   = 4     #8
     #------------------------------------------------------------------#
     #   解冻阶段训练参数
@@ -169,7 +172,7 @@ if __name__ == "__main__":
     #   UnFreeze_Epoch          模型总共训练的epoch
     #   Unfreeze_batch_size     模型在解冻后的batch_size
     #------------------------------------------------------------------#
-    UnFreeze_Epoch      = 200           #解冻阶段权值变多，需要更大的xiancun  解冻轮数为100-50=50轮
+    UnFreeze_Epoch      = 60           #解冻阶段权值变多，需要更大的xiancun  解冻轮数为100-50=50轮
     Unfreeze_batch_size = 2     #4
     #------------------------------------------------------------------#
     #   Freeze_Train    是否进行冻结训练
@@ -282,7 +285,43 @@ if __name__ == "__main__":
         else:
             download_weights(backbone)
 
-    model   = DeepLab(num_classes=num_classes, backbone=backbone, downsample_factor=downsample_factor, pretrained=pretrained)
+    #------------------------------------------------------#
+    #   多光谱实验输出目录
+    #------------------------------------------------------#
+    # 原始代码会把所有实验都保存在 logs 下。
+    # 现在同一个仓库会做 rgb / 4band / 6band 对比实验，
+    # 如果仍然都放在 logs 里，权重和 loss 曲线很容易混在一起。
+    #
+    # 这里把保存目录整理成：
+    #   logs/rgb
+    #   logs/4band
+    #   logs/6band
+    #
+    # save_dir 后面会同时用于：
+    # - LossHistory 的日志目录
+    # - fit_one_epoch 保存权重的目录
+    base_save_dir = save_dir
+    save_dir = os.path.join(base_save_dir, band_mode)
+    if local_rank == 0:
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    #------------------------------------------------------#
+    #   建立 DeepLabV3+ 模型
+    #------------------------------------------------------#
+    # in_channels 来自 multispectral_config.py：
+    # - rgb   -> 3
+    # - 4band -> 4
+    # - 6band -> 6
+    #
+    # 这一步必须和数据读取时的 selected_bands 保持一致。
+    # 例如 selected_bands=[1,2,3,4,5,6] 时，模型第一层也必须是 6 通道。
+    model   = DeepLab(
+        num_classes=num_classes,
+        backbone=backbone,
+        downsample_factor=downsample_factor,
+        pretrained=pretrained,
+        in_channels=in_channels,
+    )
     if not pretrained:
         weights_init(model)
     if model_path != '':
@@ -320,7 +359,9 @@ if __name__ == "__main__":
     if local_rank == 0:
         time_str        = datetime.datetime.strftime(datetime.datetime.now(),'%Y_%m_%d_%H_%M_%S')
         log_dir         = os.path.join(save_dir, "loss_" + str(time_str))
-        loss_history    = LossHistory(log_dir, model, input_shape=input_shape)
+        # TensorBoard 画模型图时也要使用当前输入通道数。
+        # 如果这里仍然固定 3 通道，6band 模型会在 add_graph 阶段报尺寸不匹配。
+        loss_history    = LossHistory(log_dir, model, input_shape=input_shape, in_channels=in_channels)
     else:
         loss_history    = None
 
@@ -366,8 +407,12 @@ if __name__ == "__main__":
     num_val     = len(val_lines)
 
     if local_rank == 0:
+        # 训练启动时把多光谱配置一起打印出来。
+        # 以后回看日志时，可以直接知道这次实验到底用了哪组波段和哪套标准化参数。
         show_config(
             num_classes = num_classes, backbone = backbone, model_path = model_path, input_shape = input_shape, \
+            band_mode = band_mode, image_ext = image_ext, selected_bands = selected_bands, in_channels = in_channels, \
+            normalization_config = normalization_config, base_save_dir = base_save_dir, \
             Init_Epoch = Init_Epoch, Freeze_Epoch = Freeze_Epoch, UnFreeze_Epoch = UnFreeze_Epoch, Freeze_batch_size = Freeze_batch_size, Unfreeze_batch_size = Unfreeze_batch_size, Freeze_Train = Freeze_Train, \
             Init_lr = Init_lr, Min_lr = Min_lr, optimizer_type = optimizer_type, momentum = momentum, lr_decay_type = lr_decay_type, \
             save_period = save_period, save_dir = save_dir, num_workers = num_workers, num_train = num_train, num_val = num_val
@@ -444,8 +489,27 @@ if __name__ == "__main__":
         if epoch_step == 0 or epoch_step_val == 0:
             raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
 
-        train_dataset   = DeeplabDataset(train_lines, input_shape, num_classes, True, VOCdevkit_path)
-        val_dataset     = DeeplabDataset(val_lines, input_shape, num_classes, False, VOCdevkit_path)
+        # 将影像后缀和波段选择传给数据集读取器。
+        # 当前 train.py 已经准备好这些参数；
+        # 下一步会改 utils/dataloader.py，让 DeeplabDataset 真正支持 tif + selected_bands。
+        train_dataset   = DeeplabDataset(
+            train_lines,
+            input_shape,
+            num_classes,
+            True,
+            VOCdevkit_path,
+            image_ext=image_ext,
+            selected_bands=selected_bands,
+        )
+        val_dataset     = DeeplabDataset(
+            val_lines,
+            input_shape,
+            num_classes,
+            False,
+            VOCdevkit_path,
+            image_ext=image_ext,
+            selected_bands=selected_bands,
+        )
 
         if distributed:
             train_sampler   = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True,)
@@ -468,8 +532,10 @@ if __name__ == "__main__":
         #   记录eval的map曲线
         #----------------------#
         if local_rank == 0:
+            # 评估阶段也必须读取同一批 tif 波段。
+            # 否则会出现“训练用 6 波段、验证 mIoU 却读 jpg/RGB”的不一致。
             eval_callback   = EvalCallback(model, input_shape, num_classes, val_lines, VOCdevkit_path, log_dir, Cuda, \
-                                            eval_flag=eval_flag, period=eval_period)
+                                            eval_flag=eval_flag, period=eval_period, image_ext=image_ext, selected_bands=selected_bands)
         else:
             eval_callback   = None
         
