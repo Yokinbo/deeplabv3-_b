@@ -11,7 +11,9 @@ from utils.utils import cvtColor, preprocess_input
 
 
 class DeeplabDataset(Dataset):
-    def __init__(self, annotation_lines, input_shape, num_classes, train, dataset_path, image_ext=".jpg", selected_bands=None):
+    def __init__(self, annotation_lines, input_shape, num_classes, train, dataset_path,
+                 image_ext=".jpg", selected_bands=None, normalization_config=None,
+                 augmentation_config=None):
         super(DeeplabDataset, self).__init__()
         self.annotation_lines   = annotation_lines
         self.length             = len(annotation_lines)
@@ -25,6 +27,8 @@ class DeeplabDataset(Dataset):
         #    这里使用 1-based 波段编号，和 rasterio / 遥感软件习惯一致。
         self.image_ext          = image_ext
         self.selected_bands     = selected_bands
+        self.normalization_config = normalization_config or {}
+        self.augmentation_config = augmentation_config or {"enabled": False}
 
     def __len__(self):
         return self.length
@@ -46,6 +50,8 @@ class DeeplabDataset(Dataset):
         #   数据增强
         #-------------------------------#
         jpg, png    = self.get_random_data(jpg, png, self.input_shape, random = self.train)
+        if self._use_training_augmentation(jpg):
+            jpg, png = self._augment_training_sample(jpg, png)
 
         # get_random_data 之后：
         # - RGB 旧流程可能返回 PIL.Image 或 HWC numpy
@@ -89,6 +95,125 @@ class DeeplabDataset(Dataset):
 
     def rand(self, a=0, b=1):
         return np.random.rand() * (b - a) + a
+
+    def _use_training_augmentation(self, image):
+        return (
+            self.train
+            and self.augmentation_config.get("enabled", False)
+            and self.image_ext.lower() in [".tif", ".tiff"]
+            and isinstance(image, np.ndarray)
+            and image.ndim == 3
+        )
+
+    def _to_reflectance(self, image):
+        image = image.astype(np.float32, copy=True)
+        scale = float(self.normalization_config.get("reflectance_scale", 10000.0))
+        if scale <= 0:
+            raise ValueError("normalization_config['reflectance_scale'] must be greater than 0.")
+        return image / scale
+
+    def _from_reflectance(self, reflectance):
+        image = reflectance.astype(np.float32, copy=False)
+        if self.normalization_config.get("enable_clip", False):
+            clip_min = self._channel_values("clip_min", image.shape[2])
+            clip_max = self._channel_values("clip_max", image.shape[2])
+            image = np.clip(image, clip_min, clip_max)
+
+        scale = float(self.normalization_config.get("reflectance_scale", 10000.0))
+        return (image * scale).astype(np.float32)
+
+    def _channel_values(self, key, channels):
+        values = self.normalization_config.get(key)
+        if values is None:
+            raise ValueError(f"normalization_config is missing key: {key}")
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.ndim != 1 or arr.shape[0] != channels:
+            raise ValueError(
+                f"normalization_config['{key}'] length={arr.shape[0] if arr.ndim == 1 else arr.shape} "
+                f"does not match image channels={channels}."
+            )
+        return arr.reshape((1, 1, channels))
+
+    def _augment_training_sample(self, image, target):
+        cfg = self.augmentation_config
+        reflectance = self._to_reflectance(image)
+        target = np.array(target, dtype=np.uint8)
+
+        if np.random.rand() < cfg.get("geometry_prob", 0.0):
+            reflectance, target = self._augment_geometry(reflectance, target)
+
+        if np.random.rand() < cfg.get("scale_prob", 0.0):
+            reflectance, target = self._augment_random_scale(reflectance, target)
+
+        if np.random.rand() < cfg.get("reflectance_prob", 0.0):
+            reflectance = self._augment_reflectance(reflectance)
+
+        if np.random.rand() < cfg.get("shadow_prob", 0.0):
+            reflectance = self._augment_shadow(reflectance)
+
+        if np.random.rand() < cfg.get("noise_prob", 0.0):
+            reflectance = self._augment_noise(reflectance)
+
+        return self._from_reflectance(reflectance), target
+
+    def _augment_geometry(self, image, target):
+        op = np.random.choice(["hflip", "vflip", "rot90", "rot180", "rot270"])
+        if op == "hflip":
+            return np.ascontiguousarray(image[:, ::-1, :]), np.ascontiguousarray(target[:, ::-1])
+        if op == "vflip":
+            return np.ascontiguousarray(image[::-1, :, :]), np.ascontiguousarray(target[::-1, :])
+        k = {"rot90": 1, "rot180": 2, "rot270": 3}[op]
+        return np.rot90(image, k=k).copy(), np.rot90(target, k=k).copy()
+
+    def _augment_reflectance(self, image):
+        cfg = self.augmentation_config
+        global_low, global_high = cfg.get("reflectance_global_range", [0.90, 1.10])
+        band_low, band_high = cfg.get("reflectance_band_range", [0.95, 1.05])
+        global_factor = np.random.uniform(global_low, global_high)
+        band_factors = np.random.uniform(
+            band_low,
+            band_high,
+            size=(1, 1, image.shape[2]),
+        ).astype(np.float32)
+        return image * global_factor * band_factors
+
+    def _augment_shadow(self, image):
+        cfg = self.augmentation_config
+        factor_low, factor_high = cfg.get("shadow_factor_range", [0.75, 0.90])
+        radius_low, radius_high = cfg.get("shadow_radius_range", [0.25, 0.45])
+        h, w = image.shape[:2]
+        center_y = np.random.uniform(-0.5, 0.5)
+        center_x = np.random.uniform(-0.5, 0.5)
+        radius = np.random.uniform(radius_low, radius_high)
+        yy = np.linspace(-1, 1, h, dtype=np.float32)[:, None]
+        xx = np.linspace(-1, 1, w, dtype=np.float32)[None, :]
+        shadow = np.exp(-((xx - center_x) ** 2 + (yy - center_y) ** 2) / max(radius, 1e-6))
+        factor = np.random.uniform(factor_low, factor_high)
+        shadow_map = 1.0 - (1.0 - factor) * shadow
+        return image * shadow_map[:, :, None]
+
+    def _augment_noise(self, image):
+        sigma_low, sigma_high = self.augmentation_config.get("noise_sigma_range", [0.003, 0.008])
+        sigma = np.random.uniform(sigma_low, sigma_high)
+        noise = np.random.normal(0.0, sigma, size=image.shape).astype(np.float32)
+        return image + noise
+
+    def _augment_random_scale(self, image, target):
+        crop_low, crop_high = self.augmentation_config.get("scale_crop_range", [0.85, 1.00])
+        ratio = np.random.uniform(crop_low, crop_high)
+        h, w = image.shape[:2]
+        crop_h = max(8, int(h * ratio))
+        crop_w = max(8, int(w * ratio))
+        top = np.random.randint(0, max(1, h - crop_h + 1))
+        left = np.random.randint(0, max(1, w - crop_w + 1))
+
+        image_crop = image[top:top + crop_h, left:left + crop_w, :]
+        target_crop = target[top:top + crop_h, left:left + crop_w]
+        image = cv2.resize(image_crop, (w, h), interpolation=cv2.INTER_LINEAR)
+        target = cv2.resize(target_crop, (w, h), interpolation=cv2.INTER_NEAREST)
+        if image.ndim == 2:
+            image = image[:, :, None]
+        return image.astype(np.float32), target.astype(np.uint8)
 
     def get_random_data(self, image, label, input_shape, jitter=.3, hue=.1, sat=0.7, val=0.3, random=True):
         # 原始 DeepLab 默认把所有输入都转成 RGB。
@@ -199,7 +324,7 @@ class DeeplabDataset(Dataset):
         #   高斯模糊
         #------------------------------------------#
         blur = self.rand() < 0.25
-        if blur and image_data.ndim == 3 and image_data.shape[2] == 3: 
+        if blur and self.image_ext.lower() not in [".tif", ".tiff"] and image_data.ndim == 3 and image_data.shape[2] == 3:
             image_data = cv2.GaussianBlur(image_data, (5, 5), 0)
 
         #------------------------------------------#
@@ -241,7 +366,7 @@ class DeeplabDataset(Dataset):
         # HSV 色彩增强只适合普通 RGB。
         # 对 4/6 波段遥感影像，强行转 HSV 会破坏波段物理意义，
         # 所以多光谱输入先只保留缩放、翻转、旋转等几何增强。
-        if image_data.ndim == 3 and image_data.shape[2] == 3:
+        if self.image_ext.lower() not in [".tif", ".tiff"] and image_data.ndim == 3 and image_data.shape[2] == 3:
             image_data = image_data.astype(np.uint8)
             r               = np.random.uniform(-1, 1, 3) * [hue, sat, val] + 1
             #---------------------------------#

@@ -141,3 +141,39 @@ normalization_configs = {
 # 当前模式实际使用的标准化参数。
 # 后续 utils/utils.py 的 preprocess_input 会读取它。
 normalization_config = normalization_configs[band_mode]
+
+
+# ---------------------------------------------------------------------
+# Training-time online data augmentation
+# ---------------------------------------------------------------------
+# Keep this config aligned with the other segmentation model branches when
+# running paper comparison experiments.
+train_augmentation_config = {
+    "enabled": True,
+
+    # Multispectral reflectance perturbation.
+    # Simulates seasonal, solar-angle, atmospheric and surface-moisture changes.
+    "reflectance_prob": 0.50,
+    "reflectance_global_range": [0.90, 1.10],
+    "reflectance_band_range": [0.95, 1.05],
+
+    # Geometry perturbation.
+    # Simulates different PV array directions and cutting orientations.
+    "geometry_prob": 0.50,
+
+    # Soft local shadow / thin cloud-shadow perturbation.
+    # Simulates residual cloud shadow, terrain shadow and PV array shadow.
+    "shadow_prob": 0.25,
+    "shadow_factor_range": [0.75, 0.90],
+    "shadow_radius_range": [0.25, 0.45],
+
+    # Mild Gaussian noise.
+    # Simulates sensor noise, atmospheric residuals and local abnormal pixels.
+    "noise_prob": 0.25,
+    "noise_sigma_range": [0.003, 0.008],
+
+    # Random scale by crop and resize back.
+    # Simulates different PV plant sizes and patch cutting positions.
+    "scale_prob": 0.20,
+    "scale_crop_range": [0.85, 1.00],
+}

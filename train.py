@@ -19,7 +19,8 @@ from utils.utils import (download_weights, seed_everything, show_config,
                          worker_init_fn)
 from utils.utils_fit import fit_one_epoch
 from multispectral_config import (band_mode, image_ext, in_channels,
-                                  normalization_config, selected_bands)
+                                  normalization_config, selected_bands,
+                                  train_augmentation_config)
 
 '''
 训练自己的语义分割模型一定需要注意以下几点：
@@ -412,7 +413,7 @@ if __name__ == "__main__":
         show_config(
             num_classes = num_classes, backbone = backbone, model_path = model_path, input_shape = input_shape, \
             band_mode = band_mode, image_ext = image_ext, selected_bands = selected_bands, in_channels = in_channels, \
-            normalization_config = normalization_config, base_save_dir = base_save_dir, \
+            normalization_config = normalization_config, train_augmentation_config = train_augmentation_config, base_save_dir = base_save_dir, \
             Init_Epoch = Init_Epoch, Freeze_Epoch = Freeze_Epoch, UnFreeze_Epoch = UnFreeze_Epoch, Freeze_batch_size = Freeze_batch_size, Unfreeze_batch_size = Unfreeze_batch_size, Freeze_Train = Freeze_Train, \
             Init_lr = Init_lr, Min_lr = Min_lr, optimizer_type = optimizer_type, momentum = momentum, lr_decay_type = lr_decay_type, \
             save_period = save_period, save_dir = save_dir, num_workers = num_workers, num_train = num_train, num_val = num_val
@@ -500,6 +501,8 @@ if __name__ == "__main__":
             VOCdevkit_path,
             image_ext=image_ext,
             selected_bands=selected_bands,
+            normalization_config=normalization_config,
+            augmentation_config=train_augmentation_config,
         )
         val_dataset     = DeeplabDataset(
             val_lines,
@@ -509,6 +512,7 @@ if __name__ == "__main__":
             VOCdevkit_path,
             image_ext=image_ext,
             selected_bands=selected_bands,
+            normalization_config=normalization_config,
         )
 
         if distributed:
