@@ -11,6 +11,7 @@ model_data/
 vscode/
 img/
 img_out/
+论文制图/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
